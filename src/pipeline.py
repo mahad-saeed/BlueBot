@@ -48,7 +48,7 @@ If the context does not contain the answer, say: "I don't have that information.
 Be concise. One or two sentences maximum."""
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.2:1b"
+OLLAMA_MODEL = "llama3.1:8b"
 
 def _extract_relevant_lines(query: str, text: str) -> str:
     query_lower = query.lower()
