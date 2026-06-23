@@ -9,6 +9,7 @@ Flow:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 import time
@@ -16,13 +17,54 @@ import time
 import requests
 from sentence_transformers import SentenceTransformer
 
+import re
 
+# Conservative split: only break on clear conjunction/sentence boundaries.
+# Deliberately not splitting on bare commas - too likely to break single
+# questions that just happen to contain a comma.
+_SUBQUERY_SPLIT_PATTERN = re.compile(r"\s+and\s+|[.?]\s+|,\s*but\s+", re.IGNORECASE)
+
+
+def _split_subqueries(query: str) -> list[str]:
+    """Split a compound question into sub-questions for separate retrieval."""
+    parts = [p.strip() for p in _SUBQUERY_SPLIT_PATTERN.split(query) if p.strip()]
+    return parts if len(parts) > 1 else [query]
+
+
+def _merge_retrievals(results: list) -> _retriever.RetrievalResult:
+    """Merge multiple RetrievalResults, deduping by chunk_id, keeping closest-first order."""
+    seen_keys: set = set()
+    merged_chunks: list = []
+    any_relevant = False
+
+    for result in results:
+        any_relevant = any_relevant or result.is_relevant
+        for chunk in result.chunks:
+            key = chunk.text.strip().lower()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged_chunks.append(chunk)
+
+    merged_chunks.sort(key=lambda c: c.distance)
+    return _retriever.RetrievalResult(chunks=merged_chunks, is_relevant=any_relevant)
+
+_GREETINGS = {"hi", "hello", "hey", "salam", "assalamualaikum", "good morning", "good afternoon", "good evening"}
+GREETING_RESPONSE = "Hi! I'm BlueBot, Airblue's customer service assistant. Ask me about fares, baggage, check-in, or refunds."
 # Ensure project root is importable when running: python src/pipeline.py "question"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import EMBEDDING_MODEL_NAME  # noqa: E402
+from src.config import (  # noqa: E402
+    EMBEDDING_MODEL_NAME,
+    LLM_CONTEXT_CHUNKS,
+    MAX_CHUNK_CHARS,
+    OLLAMA_MODEL,
+    OLLAMA_NUM_CTX,
+    OLLAMA_NUM_PREDICT,
+    OLLAMA_TIMEOUT_SECONDS,
+)
 
 # Load embedding model once at import time; shared with retriever below.
 _EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -33,50 +75,82 @@ import src.retriever as _retriever  # noqa: E402
 _retriever._MODEL = _EMBEDDING_MODEL
 retrieve = _retriever.retrieve
 
+DEBUG = os.environ.get("BLUEBOT_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
 
 FALLBACK_MESSAGE = (
     "I don't have information about that. For assistance please contact Airblue "
     "support at 111-247-258 or visit airblue.com"
 )
 
-SYSTEM_PROMPT = SYSTEM_PROMPT = """You are BlueBot, a customer service assistant for Airblue Pakistan.
-Answer using ONLY the exact facts in the CONTEXT below.
-For baggage questions, state ONLY the specific fare type asked about.
-Do not list or summarize other fare types.
+SYSTEM_PROMPT = """You are BlueBot, a customer service assistant for Airblue Pakistan.
+Answer using ONLY the exact facts in the CONTEXT below.Never state a fare name, price, or number that does not appear verbatim in the CONTEXT. If you are unsure, say you don't have that information.
+If the customer asks about one specific fare type, answer only for that fare.
+If the customer asks what fare types exist, list only the fare type names found in the context.
 Do not mention meals, seat selection, or BlueMiles unless the customer asks.
 If the context does not contain the answer, say: "I don't have that information. Please contact Airblue support at 111-247-258."
 Be concise. One or two sentences maximum."""
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.1:8b"
 
-def _extract_relevant_lines(query: str, text: str) -> str:
-    query_lower = query.lower()
-    fare_keywords = {"value": "Value", "flexi": "Flexi", "xtra": "Xtra"}
-    detected_fare = None
-    for keyword, label in fare_keywords.items():
-        if keyword in query_lower:
-            detected_fare = label
-            break
-    if not detected_fare:
+_FARE_SECTION_PREFIXES = ("Value ", "Flexi ", "Xtra ")
+_FARE_LIST_PHRASES = ("fare type", "fare types", "types of fare", "what fares", "which fares")
+
+
+def _truncate(text: str, max_chars: int = MAX_CHUNK_CHARS) -> str:
+    """Keep prompts short so Ollama spends less time on context processing."""
+    if len(text) <= max_chars:
         return text
-    lines = text.split("\n")
-    capture = False
-    result = []
-    for line in lines:
-        if line.strip().startswith(detected_fare):
-            capture = True
-        elif any(line.strip().startswith(label) for label in fare_keywords.values()) and capture:
-            break
-        if capture:
-            result.append(line)
-    return "\n".join(result) if result else text
+    return text[:max_chars].rstrip() + "..."
+
+
+def _is_fare_list_query(query: str) -> bool:
+    q = query.lower()
+    return any(phrase in q for phrase in _FARE_LIST_PHRASES)
+
+
+_SINGLE_TOPIC_MAX_WORDS = 6
+
+def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
+    """Pick prompt context chunks based on query intent."""
+    if _is_fare_list_query(query):
+        by_fare: dict[str, tuple[str, str]] = {}
+        for chunk in chunks:
+            for prefix in _FARE_SECTION_PREFIXES:
+                fare_name = prefix.strip()
+                if chunk.text.startswith(prefix):
+                    existing = by_fare.get(fare_name)
+                    if existing is None or len(chunk.text) > len(existing[1]):
+                        by_fare[fare_name] = (chunk.source, chunk.text)
+
+        for fare_name in ("Value", "Flexi", "Xtra"):
+            if fare_name in by_fare:
+                continue
+            supplemental = retrieve(f"{fare_name} fare baggage allowance", k=3)
+            for chunk in supplemental.chunks:
+                if chunk.text.startswith(f"{fare_name} "):
+                    by_fare[fare_name] = (chunk.source, chunk.text)
+                    break
+
+        if by_fare:
+            return [by_fare[name] for name in ("Value", "Flexi", "Xtra") if name in by_fare]
+
+    # Only take the single-fare shortcut for short, single-topic queries.
+    # Longer/compound questions (e.g. "I have a flexi fare and my flight got
+    # cancelled...") shouldn't be narrowed to just the fare chunk, since they
+    # likely need other context too.
+    if len(query.split()) <= _SINGLE_TOPIC_MAX_WORDS:
+        for chunk in chunks:
+            for prefix in _FARE_SECTION_PREFIXES:
+                if prefix.strip().lower() in query.lower() and chunk.text.startswith(prefix):
+                    return [(chunk.source, chunk.text)]
+
+    return [(chunk.source, chunk.text) for chunk in chunks[:LLM_CONTEXT_CHUNKS]]
 
 def _build_prompt(query: str, contexts: list[tuple[str, str]]) -> str:
     context_blocks: list[str] = []
     for source, text in contexts:
-        filtered = _extract_relevant_lines(query, text)
-        context_blocks.append(f"[Source: {source}]\n{filtered}")
+        context_blocks.append(f"[Source: {source}]\n{_truncate(text)}")
 
     context_text = "\n\n".join(context_blocks)
     return (
@@ -94,18 +168,20 @@ def _generate_with_ollama(prompt: str) -> str:
         "stream": False,
         "keep_alive": "10m",
         "options": {
+            "num_ctx": OLLAMA_NUM_CTX,
             "temperature": 0.1,
-            "num_predict": 150,
-        }
+            "num_predict": OLLAMA_NUM_PREDICT,
+        },
     }
 
-    response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
     response.raise_for_status()
 
     data = response.json()
     if "response" not in data:
         raise ValueError("Ollama response JSON missing 'response' field.")
     return str(data["response"]).strip()
+
 
 def ask(query: str) -> dict:
     """
@@ -121,21 +197,53 @@ def ask(query: str) -> dict:
             "is_relevant": bool
         }
     """
-    retrieval = retrieve(query)
+    cleaned = query.strip().lower()
+    if cleaned in _GREETINGS:
+        return {"answer": GREETING_RESPONSE, "sources": [], "is_relevant": True}
+    subqueries = _split_subqueries(query)
+    if len(subqueries) > 1:
+        retrieval = _merge_retrievals([retrieve(q) for q in subqueries])
+    else:
+        retrieval = retrieve(query)
 
-    # Collect unique sources while preserving first-seen order.
-    sources = list(dict.fromkeys(chunk.source for chunk in retrieval.chunks if chunk.source))
+    if DEBUG:
+        print("\n===== RAW RETRIEVED CHUNKS =====")
+        for chunk in retrieval.chunks:
+            print(f"[source: {chunk.source}]")
+            print(chunk.text)
+            print()
 
     # Hard guardrail: if query is not relevant, do NOT call the LLM.
     if not retrieval.is_relevant:
+        # No LLM call happened, so "sources used" should reflect what was
+        # retrieved and rejected, not what was sent to a prompt.
+        sources = list(dict.fromkeys(chunk.source for chunk in retrieval.chunks if chunk.source))
         return {
             "answer": FALLBACK_MESSAGE,
             "sources": sources,
             "is_relevant": False,
         }
 
-    contexts = [(chunk.source, chunk.text) for chunk in retrieval.chunks]
+    # Send only the best chunk(s) to Ollama to keep generation fast.
+    contexts = _select_contexts(query, retrieval.chunks)
+
+    # sources now reflects only what actually went into the prompt
+    sources = list(dict.fromkeys(source for source, _ in contexts if source))
+
+    if DEBUG:
+        print("===== CONTEXT SENT TO PROMPT (after truncate) =====")
+        for source, text in contexts:
+            print(f"[source: {source}]")
+            print(_truncate(text))
+            print()
+
     prompt = _build_prompt(query=query, contexts=contexts)
+
+    if DEBUG:
+        print("===== FINAL PROMPT SENT TO OLLAMA =====")
+        print(prompt)
+        print("===== END =====\n")
+
     answer = _generate_with_ollama(prompt)
 
     return {
@@ -143,26 +251,38 @@ def ask(query: str) -> dict:
         "sources": sources,
         "is_relevant": True,
     }
-
-
+TEST_QUERIES = [
+    "what is baggage allowance on value fare",
+    "what are the fare types",
+    "can i checkin luggage on value fare",
+]
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print('Usage: python src/pipeline.py "your question here"')
-        raise SystemExit(1)
+    cli_args = sys.argv[1:]
+    if "--debug" in cli_args:
+        DEBUG = True
+        cli_args = [arg for arg in cli_args if arg != "--debug"]
 
-    question = " ".join(sys.argv[1:]).strip()
-
-    started = time.perf_counter()
-    result = ask(question)
-    elapsed_seconds = time.perf_counter() - started
-
-    print("\nAnswer:")
-    print(result["answer"])
-    print("\nSources used:")
-    if result["sources"]:
-        for source in result["sources"]:
-            print(f"- {source}")
+    if "--batch" in cli_args:
+        pending = list(TEST_QUERIES)
     else:
-        print("- (none)")
-    print(f"\nIs relevant: {result['is_relevant']}")
-    print(f"Response time: {elapsed_seconds:.2f} seconds")
+        pending = [" ".join(cli_args).strip()] if cli_args else []
+
+    while True:
+        question = pending.pop(0) if pending else input("\nQuestion (empty to quit): ").strip()
+        if not question:
+            break
+
+        started = time.perf_counter()
+        result = ask(question)
+        elapsed_seconds = time.perf_counter() - started
+
+        print("\nAnswer:")
+        print(result["answer"])
+        print("\nSources used:")
+        if result["sources"]:
+            for source in result["sources"]:
+                print(f"- {source}")
+        else:
+            print("- (none)")
+        print(f"\nIs relevant: {result['is_relevant']}")
+        print(f"Response time: {elapsed_seconds:.2f} seconds")

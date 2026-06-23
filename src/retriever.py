@@ -8,6 +8,7 @@ calling the LLM when policy context is not a reliable match.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -21,7 +22,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import CHROMA_DIR, COLLECTION_NAME, EMBEDDING_MODEL_NAME  # noqa: E402
+from src.config import (  # noqa: E402
+    CHROMA_DIR,
+    COLLECTION_NAME,
+    DISTANCE_MARGIN,
+    EMBEDDING_MODEL_NAME,
+    RETRIEVAL_K_MAX,
+)
+
+DEBUG = os.environ.get("BLUEBOT_DEBUG", "").strip().lower() in ("1", "true", "yes")
 
 
 # Calibrated starter threshold from observed distance separation in this corpus:
@@ -82,7 +91,10 @@ def _ensure_collection_ready() -> None:
 
 def retrieve(query: str, k: int = 3, debug: bool = False) -> RetrievalResult:
     """
-    Retrieve top-k policy chunks for a query using manual query embeddings.
+    Retrieve policy chunks using distance-margin selection over manual query embeddings.
+
+    Fetches up to RETRIEVAL_K_MAX candidates from Chroma, then keeps only chunks whose
+    distance is within DISTANCE_MARGIN of the best (lowest) distance.
 
     This collection was created without a Chroma embedding_function, and documents
     were embedded manually with SentenceTransformer(all-MiniLM-L6-v2). Therefore we
@@ -94,11 +106,11 @@ def retrieve(query: str, k: int = 3, debug: bool = False) -> RetrievalResult:
 
     Args:
         query: User question text.
-        k: Number of chunks to retrieve (default 3).
-        debug: If True, print each retrieved chunk to stdout before returning.
+        k: Kept for backward compatibility; Chroma fetch size uses RETRIEVAL_K_MAX.
+        debug: If True, print each returned chunk to stdout before returning.
 
     Returns:
-        RetrievalResult with chunks and relevance flag.
+        RetrievalResult with margin-filtered chunks and relevance flag.
     """
     _ensure_collection_ready()
 
@@ -106,12 +118,15 @@ def retrieve(query: str, k: int = 3, debug: bool = False) -> RetrievalResult:
     if not cleaned_query:
         return RetrievalResult(chunks=[], is_relevant=False)
 
-    safe_k = max(1, k)
+    n_results = min(RETRIEVAL_K_MAX, _COLLECTION.count())
 
-    query_embedding = _get_model().encode(cleaned_query).tolist()
+    query_embedding = _get_model().encode(
+        cleaned_query,
+        show_progress_bar=False,
+    ).tolist()
     raw = _COLLECTION.query(
         query_embeddings=[query_embedding],
-        n_results=safe_k,
+        n_results=n_results,
         include=["documents", "metadatas", "distances"],
     )
 
@@ -119,7 +134,7 @@ def retrieve(query: str, k: int = 3, debug: bool = False) -> RetrievalResult:
     metadatas = raw.get("metadatas", [[]])[0] or []
     distances = raw.get("distances", [[]])[0] or []
 
-    chunks: list[RetrievedChunk] = []
+    candidates: list[RetrievedChunk] = []
     for document, metadata, distance in zip(documents, metadatas, distances):
         chunk_id = ""
         source = ""
@@ -127,7 +142,7 @@ def retrieve(query: str, k: int = 3, debug: bool = False) -> RetrievalResult:
             chunk_id = str(metadata.get("chunk_id", ""))
             source = str(metadata.get("source", ""))
 
-        chunks.append(
+        candidates.append(
             RetrievedChunk(
                 text=str(document),
                 source=source,
@@ -136,11 +151,21 @@ def retrieve(query: str, k: int = 3, debug: bool = False) -> RetrievalResult:
             )
         )
 
-    if not chunks:
+    if not candidates:
         return RetrievalResult(chunks=[], is_relevant=False)
 
-    best_distance = min(chunk.distance for chunk in chunks)
+    best_distance = min(chunk.distance for chunk in candidates)
     is_relevant = best_distance <= DISTANCE_THRESHOLD
+
+    margin_cutoff = best_distance + DISTANCE_MARGIN
+    chunks = [chunk for chunk in candidates if chunk.distance <= margin_cutoff]
+
+    if DEBUG:
+        print(
+            f"[retriever] best_distance={best_distance:.6f} "
+            f"margin_cutoff={margin_cutoff:.6f} "
+            f"passed={len(chunks)}/{len(candidates)}"
+        )
 
     if debug:
         for idx, chunk in enumerate(chunks, start=1):

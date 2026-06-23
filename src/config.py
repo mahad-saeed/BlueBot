@@ -17,3 +17,17 @@ COLLECTION_NAME = "airblue_policies"
 
 # Embedding model used for both indexing and retrieval
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+
+# Distance-margin retrieval: fetch up to K_MAX candidates, keep those within margin of best
+RETRIEVAL_K_MAX = 8
+DISTANCE_MARGIN = 0.25
+
+# Retrieval / generation tuning (smaller values = faster on low-end hardware)
+#RETRIEVAL_TOP_K = 3
+#FARE_LIST_RETRIEVAL_K = 10
+LLM_CONTEXT_CHUNKS = 6
+MAX_CHUNK_CHARS = 450
+OLLAMA_MODEL = "phi4-mini"
+OLLAMA_NUM_CTX = 1024
+OLLAMA_NUM_PREDICT = 60
+OLLAMA_TIMEOUT_SECONDS = 90
