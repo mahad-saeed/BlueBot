@@ -115,7 +115,7 @@ If the customer asks about one specific fare type, answer only for that fare.
 If the customer asks what fare types exist, list only the fare type names found in the context.
 Do not mention meals, seat selection, or BlueMiles unless the customer asks.
 If the context does not contain the answer, say: "I don't have that information. Please contact Airblue support at 111-247-258."
-Be concise. One or two sentences maximum."""
+Be concise. One or two sentences maximum.If the CONTEXT discusses a related but different scenario (e.g. delay liability when asked about cancellation, or vice versa), say you don't have that specific information rather than answering with the related scenario's facts."""
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
