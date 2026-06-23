@@ -4,79 +4,20 @@ End-to-end BlueBot question pipeline.
 Flow:
 1) Retrieve policy chunks from local ChromaDB
 2) If not relevant, return fallback without calling the LLM
-3) If relevant, build constrained prompt and call local Ollama HTTP API
+3) If relevant, build constrained prompt and call the LLM (local Ollama or Groq)
 """
 
 from __future__ import annotations
 
 import os
-import os
-
-USE_GROQ = os.environ.get("USE_GROQ", "").strip().lower() in ("1", "true", "yes")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-
-def _generate_with_groq(prompt: str) -> str:
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "max_tokens": OLLAMA_NUM_PREDICT,
-    }
-    response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    data = response.json()
-    return str(data["choices"][0]["message"]["content"]).strip()
-
-
-def _generate(prompt: str) -> str:
-    if USE_GROQ:
-        return _generate_with_groq(prompt)
-    return _generate_with_ollama(prompt)
-from pathlib import Path
+import re
 import sys
 import time
+from pathlib import Path
 
 import requests
 from sentence_transformers import SentenceTransformer
 
-import re
-
-# Conservative split: only break on clear conjunction/sentence boundaries.
-# Deliberately not splitting on bare commas - too likely to break single
-# questions that just happen to contain a comma.
-_SUBQUERY_SPLIT_PATTERN = re.compile(r"\s+and\s+|[.?]\s+|,\s*but\s+", re.IGNORECASE)
-
-
-def _split_subqueries(query: str) -> list[str]:
-    """Split a compound question into sub-questions for separate retrieval."""
-    parts = [p.strip() for p in _SUBQUERY_SPLIT_PATTERN.split(query) if p.strip()]
-    return parts if len(parts) > 1 else [query]
-
-
-def _merge_retrievals(results: list) -> _retriever.RetrievalResult:
-    """Merge multiple RetrievalResults, deduping by chunk_id, keeping closest-first order."""
-    seen_keys: set = set()
-    merged_chunks: list = []
-    any_relevant = False
-
-    for result in results:
-        any_relevant = any_relevant or result.is_relevant
-        for chunk in result.chunks:
-            key = chunk.text.strip().lower()
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            merged_chunks.append(chunk)
-
-    merged_chunks.sort(key=lambda c: c.distance)
-    return _retriever.RetrievalResult(chunks=merged_chunks, is_relevant=any_relevant)
-
-_GREETINGS = {"hi", "hello", "hey", "salam", "assalamualaikum", "good morning", "good afternoon", "good evening"}
-GREETING_RESPONSE = "Hi! I'm BlueBot, Airblue's customer service assistant. Ask me about fares, baggage, check-in, or refunds."
 # Ensure project root is importable when running: python src/pipeline.py "question"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -103,31 +44,97 @@ retrieve = _retriever.retrieve
 
 DEBUG = os.environ.get("BLUEBOT_DEBUG", "").strip().lower() in ("1", "true", "yes")
 
+# ----- Generation backend config -----
+# Local dev (no env vars set) uses Ollama. Production (Railway) sets USE_GROQ=true
+# + GROQ_API_KEY since Railway's containers don't run Ollama. Same pipeline logic
+# either way - only the generation backend changes.
+USE_GROQ = os.environ.get("USE_GROQ", "").strip().lower() in ("1", "true", "yes")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+OLLAMA_URL = "http://localhost:11434/api/generate"
 
+# ----- Fixed responses -----
 FALLBACK_MESSAGE = (
     "I don't have information about that. For assistance please contact Airblue "
     "support at 111-247-258 or visit airblue.com"
 )
 
+_GREETINGS = {
+    "hi", "hello", "hey", "salam", "assalamualaikum",
+    "good morning", "good afternoon", "good evening",
+}
+GREETING_RESPONSE = (
+    "Hi! I'm BlueBot, Airblue's customer service assistant. "
+    "Ask me about fares, baggage, check-in, or refunds."
+)
+
+INVALID_QUERY_MESSAGE = (
+    "I didn't quite catch that — could you rephrase your question about "
+    "Airblue fares, baggage, check-in, or refunds?"
+)
+
 SYSTEM_PROMPT = """You are BlueBot, a customer service assistant for Airblue Pakistan.
-Answer using ONLY the exact facts in the CONTEXT below.Never state a fare name, price, or number that does not appear verbatim in the CONTEXT. If you are unsure, say you don't have that information.
+Answer using ONLY the exact facts in the CONTEXT below.
+Never state a fare name, price, or number that does not appear verbatim in the CONTEXT. If you are unsure, say you don't have that information.
 If the customer asks about one specific fare type, answer only for that fare.
 If the customer asks what fare types exist, list only the fare type names found in the context.
 Do not mention meals, seat selection, or BlueMiles unless the customer asks.
 If the context does not contain the answer, say: "I don't have that information. Please contact Airblue support at 111-247-258."
-Be concise. One or two sentences maximum.If the CONTEXT discusses a related but different scenario (e.g. delay liability when asked about cancellation, or vice versa), say you don't have that specific information rather than answering with the related scenario's facts."""
-
-OLLAMA_URL = "http://localhost:11434/api/generate"
+If the CONTEXT discusses a related but different scenario (e.g. delay liability when asked about cancellation, or vice versa), say you don't have that specific information rather than answering with the related scenario's facts.
+Be concise. One to three sentences maximum."""
 
 _FARE_SECTION_PREFIXES = ("Value ", "Flexi ", "Xtra ")
 _FARE_LIST_PHRASES = ("fare type", "fare types", "types of fare", "what fares", "which fares")
+_SINGLE_TOPIC_MAX_WORDS = 6
+_MIN_QUERY_CHARS = 3
+_ALPHA_PATTERN = re.compile(r"[a-zA-Z]")
+
+# Conservative split: only break on clear conjunction/sentence boundaries.
+# Deliberately not splitting on bare commas - too likely to break single
+# questions that just happen to contain a comma.
+_SUBQUERY_SPLIT_PATTERN = re.compile(r"\s+and\s+|[.?]\s+|,\s*but\s+", re.IGNORECASE)
 
 
-def _truncate(text: str, max_chars: int = MAX_CHUNK_CHARS) -> str:
-    """Keep prompts short so Ollama spends less time on context processing."""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + "..."
+# ----- Query validation / splitting -----
+
+def _is_valid_query(query: str) -> bool:
+    """Reject empty, too-short, or non-alphabetic gibberish before retrieval."""
+    stripped = query.strip()
+    if len(stripped) < _MIN_QUERY_CHARS:
+        return False
+    if not _ALPHA_PATTERN.search(stripped):
+        return False
+    # Reject if alphabetic characters are a small minority (e.g. "asdkj!!!123???")
+    alpha_count = sum(c.isalpha() for c in stripped)
+    if alpha_count / len(stripped) < 0.5:
+        return False
+    return True
+
+
+def _split_subqueries(query: str) -> list[str]:
+    """Split a compound question into sub-questions for separate retrieval."""
+    parts = [p.strip() for p in _SUBQUERY_SPLIT_PATTERN.split(query) if p.strip()]
+    return parts if len(parts) > 1 else [query]
+
+
+def _merge_retrievals(results: list) -> _retriever.RetrievalResult:
+    """Merge multiple RetrievalResults, deduping by normalized text, closest-first."""
+    seen_keys: set = set()
+    merged_chunks: list = []
+    any_relevant = False
+
+    for result in results:
+        any_relevant = any_relevant or result.is_relevant
+        for chunk in result.chunks:
+            key = chunk.text.strip().lower()
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged_chunks.append(chunk)
+
+    merged_chunks.sort(key=lambda c: c.distance)
+    return _retriever.RetrievalResult(chunks=merged_chunks, is_relevant=any_relevant)
 
 
 def _is_fare_list_query(query: str) -> bool:
@@ -135,7 +142,14 @@ def _is_fare_list_query(query: str) -> bool:
     return any(phrase in q for phrase in _FARE_LIST_PHRASES)
 
 
-_SINGLE_TOPIC_MAX_WORDS = 6
+# ----- Context selection / prompt building -----
+
+def _truncate(text: str, max_chars: int = MAX_CHUNK_CHARS) -> str:
+    """Keep prompts short so generation spends less time on context processing."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
+
 
 def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
     """Pick prompt context chunks based on query intent."""
@@ -162,9 +176,7 @@ def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
             return [by_fare[name] for name in ("Value", "Flexi", "Xtra") if name in by_fare]
 
     # Only take the single-fare shortcut for short, single-topic queries.
-    # Longer/compound questions (e.g. "I have a flexi fare and my flight got
-    # cancelled...") shouldn't be narrowed to just the fare chunk, since they
-    # likely need other context too.
+    # Longer/compound questions shouldn't be narrowed to just one fare chunk.
     if len(query.split()) <= _SINGLE_TOPIC_MAX_WORDS:
         for chunk in chunks:
             for prefix in _FARE_SECTION_PREFIXES:
@@ -172,6 +184,7 @@ def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
                     return [(chunk.source, chunk.text)]
 
     return [(chunk.source, chunk.text) for chunk in chunks[:LLM_CONTEXT_CHUNKS]]
+
 
 def _build_prompt(query: str, contexts: list[tuple[str, str]]) -> str:
     context_blocks: list[str] = []
@@ -187,6 +200,8 @@ def _build_prompt(query: str, contexts: list[tuple[str, str]]) -> str:
     )
 
 
+# ----- Generation backends -----
+
 def _generate_with_ollama(prompt: str) -> str:
     payload = {
         "model": OLLAMA_MODEL,
@@ -199,33 +214,50 @@ def _generate_with_ollama(prompt: str) -> str:
             "num_predict": OLLAMA_NUM_PREDICT,
         },
     }
-
     response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
     response.raise_for_status()
-
     data = response.json()
     if "response" not in data:
         raise ValueError("Ollama response JSON missing 'response' field.")
     return str(data["response"]).strip()
 
 
+def _generate_with_groq(prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": OLLAMA_NUM_PREDICT,
+    }
+    response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    data = response.json()
+    return str(data["choices"][0]["message"]["content"]).strip()
+
+
+def _generate(prompt: str) -> str:
+    if USE_GROQ:
+        return _generate_with_groq(prompt)
+    return _generate_with_ollama(prompt)
+
+
+# ----- Main entrypoint -----
+
 def ask(query: str) -> dict:
     """
     Run retrieval + guarded generation for a user question.
 
-    Args:
-        query: User's question text.
-
     Returns:
-        {
-            "answer": str,
-            "sources": [list of source filenames used],
-            "is_relevant": bool
-        }
+        {"answer": str, "sources": [source filenames used], "is_relevant": bool}
     """
     cleaned = query.strip().lower()
     if cleaned in _GREETINGS:
         return {"answer": GREETING_RESPONSE, "sources": [], "is_relevant": True}
+
+    if not _is_valid_query(query):
+        return {"answer": INVALID_QUERY_MESSAGE, "sources": [], "is_relevant": False}
+
     subqueries = _split_subqueries(query)
     if len(subqueries) > 1:
         retrieval = _merge_retrievals([retrieve(q) for q in subqueries])
@@ -241,19 +273,10 @@ def ask(query: str) -> dict:
 
     # Hard guardrail: if query is not relevant, do NOT call the LLM.
     if not retrieval.is_relevant:
-        # No LLM call happened, so "sources used" should reflect what was
-        # retrieved and rejected, not what was sent to a prompt.
         sources = list(dict.fromkeys(chunk.source for chunk in retrieval.chunks if chunk.source))
-        return {
-            "answer": FALLBACK_MESSAGE,
-            "sources": sources,
-            "is_relevant": False,
-        }
+        return {"answer": FALLBACK_MESSAGE, "sources": sources, "is_relevant": False}
 
-    # Send only the best chunk(s) to Ollama to keep generation fast.
     contexts = _select_contexts(query, retrieval.chunks)
-
-    # sources now reflects only what actually went into the prompt
     sources = list(dict.fromkeys(source for source, _ in contexts if source))
 
     if DEBUG:
@@ -266,22 +289,20 @@ def ask(query: str) -> dict:
     prompt = _build_prompt(query=query, contexts=contexts)
 
     if DEBUG:
-        print("===== FINAL PROMPT SENT TO OLLAMA =====")
+        print("===== FINAL PROMPT SENT TO LLM =====")
         print(prompt)
         print("===== END =====\n")
 
     answer = _generate(prompt)
+    return {"answer": answer, "sources": sources, "is_relevant": True}
 
-    return {
-        "answer": answer,
-        "sources": sources,
-        "is_relevant": True,
-    }
+
 TEST_QUERIES = [
     "what is baggage allowance on value fare",
     "what are the fare types",
     "can i checkin luggage on value fare",
 ]
+
 if __name__ == "__main__":
     cli_args = sys.argv[1:]
     if "--debug" in cli_args:
