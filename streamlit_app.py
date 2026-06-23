@@ -15,13 +15,26 @@ st.set_page_config(page_title="BlueBot — Airblue Assistant", page_icon="✈️
 st.markdown(
     """
     <style>
-    .stApp { background-color: #f0f6ff; }
-    h1 { color: #003580; }
+    .stApp { background-color: #ffffff; }
+    h1 { color: #003580; font-weight: 800; }
+    [data-testid="stCaptionContainer"] p { color: #444444 !important; }
+    [data-testid="stChatMessage"] {
+        background-color: #eef1fb;
+        border: 1px solid #c3cdec;
+        border-radius: 10px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+    }
+    [data-testid="stChatMessage"] p { color: #111133; font-size: 1rem; }
+    [data-testid="stChatInput"] textarea {
+        border: 2px solid #003580 !important;
+        color: #111133 !important;
+    }
+    button[kind="primary"] { background-color: #003580 !important; color: #ffffff !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
-
 st.title("✈️ BlueBot")
 st.caption("Ask about Airblue's baggage, fares, check-in, and travel policies.")
 
