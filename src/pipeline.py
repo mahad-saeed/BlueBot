@@ -10,6 +10,32 @@ Flow:
 from __future__ import annotations
 
 import os
+import os
+
+USE_GROQ = os.environ.get("USE_GROQ", "").strip().lower() in ("1", "true", "yes")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def _generate_with_groq(prompt: str) -> str:
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": OLLAMA_NUM_PREDICT,
+    }
+    response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    data = response.json()
+    return str(data["choices"][0]["message"]["content"]).strip()
+
+
+def _generate(prompt: str) -> str:
+    if USE_GROQ:
+        return _generate_with_groq(prompt)
+    return _generate_with_ollama(prompt)
 from pathlib import Path
 import sys
 import time
@@ -244,7 +270,7 @@ def ask(query: str) -> dict:
         print(prompt)
         print("===== END =====\n")
 
-    answer = _generate_with_ollama(prompt)
+    answer = _generate(prompt)
 
     return {
         "answer": answer,
