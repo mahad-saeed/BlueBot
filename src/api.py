@@ -57,6 +57,7 @@ def chat(request: ChatRequest) -> ChatResponse:
     history_dicts = [turn.model_dump() for turn in request.history]
     print(f"[api] history received: {history_dicts}")
     result = ask(request.query, history=history_dicts)
+    print(f"[api] result: answer={result['answer'][:80]} is_relevant={result['is_relevant']} sources={result['sources']}")  # ADD THIS
     elapsed = time.perf_counter() - started
     return ChatResponse(
         answer=result["answer"],
