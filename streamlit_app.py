@@ -160,9 +160,26 @@ if "messages" not in st.session_state:
 
 
 def _send(query: str) -> None:
+    # Single-previous-turn history, matching what the pipeline actually uses
+    # (_build_retrieval_query only reads history[-1]). Messages are always
+    # appended in user, assistant pairs, so the last two entries (if present)
+    # are exactly the previous turn.
+    history = []
+    msgs = st.session_state.messages
+    if len(msgs) >= 2 and msgs[-2]["role"] == "user" and msgs[-1]["role"] == "assistant":
+        history = [{
+            "query": msgs[-2]["content"],
+            "answer": msgs[-1]["content"],
+            "is_relevant": msgs[-1].get("is_relevant", False),
+        }]
+
     st.session_state.messages.append({"role": "user", "content": query})
     try:
-        response = requests.post(API_URL, json={"query": query}, timeout=30)
+        response = requests.post(
+            API_URL,
+            json={"query": query, "history": history},
+            timeout=30,
+        )
         response.raise_for_status()
         data = response.json()
         answer = data["answer"]
@@ -182,7 +199,6 @@ def _send(query: str) -> None:
             "response_time": response_time,
         }
     )
-
 
 # ----- Empty state: starter questions -----
 if not st.session_state.messages:

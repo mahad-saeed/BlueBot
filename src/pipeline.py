@@ -69,10 +69,18 @@ GREETING_RESPONSE = (
     "Ask me about fares, baggage, check-in, or refunds."
 )
 
+SECURITY_REFUSAL_MESSAGE = (
+    "I can answer specific questions about Airblue's policies, but I can't "
+    "reproduce source documents directly. What would you like to know?"
+)
+
 INVALID_QUERY_MESSAGE = (
     "I didn't quite catch that — could you rephrase your question about "
     "Airblue fares, baggage, check-in, or refunds?"
 )
+
+_INJECTION_PATTERNS = ("ignore previous instructions", "ignore your instructions", "disregard previous", "you are now")
+
 
 SYSTEM_PROMPT = """You are BlueBot, a customer service assistant for Airblue Pakistan.
 Answer using ONLY the exact facts in the CONTEXT below.
@@ -80,9 +88,9 @@ Never state a fare name, price, or number that does not appear verbatim in the C
 If the customer asks about one specific fare type, answer only for that fare.
 If the customer asks what fare types exist, list only the fare type names found in the context.
 Do not mention meals, seat selection, or BlueMiles unless the customer asks.
+Always write numbers as digits (e.g. 4,150), never spell them out in words.
 If the context does not contain the answer, say: "I don't have that information. Please contact Airblue support at 111-247-258."
-If the CONTEXT discusses a related but different scenario (e.g. delay liability when asked about cancellation, or vice versa), say you don't have that specific information rather than answering with the related scenario's facts.
-Be concise. One to three sentences maximum."""
+Answer the customer's question directly using the relevant facts from the context. Keep it brief, but include the actual facts requested — don't just restate the fare name."""
 
 _FARE_SECTION_PREFIXES = ("Value ", "Flexi ", "Xtra ")
 _FARE_LIST_PHRASES = ("fare type", "fare types", "types of fare", "what fares", "which fares")
@@ -95,23 +103,98 @@ _ALPHA_PATTERN = re.compile(r"[a-zA-Z]")
 # questions that just happen to contain a comma.
 _SUBQUERY_SPLIT_PATTERN = re.compile(r"\s+and\s+|[.?]\s+|,\s*but\s+", re.IGNORECASE)
 
+_FIELD_LABELS = (
+    "Hand Carry Bags:", "Checked Bags:", "Meals:", "Seat Selection:",
+    "BlueMiles Rewards:", "Refunds & Exchanges:",
+)
+
+def _format_fields(text: str) -> str:
+    """Insert newlines before recognized field labels so the LLM sees clearly
+    separated facts instead of a run-on paragraph (reduces fact-blending)."""
+    formatted = text
+    for label in _FIELD_LABELS:
+        formatted = formatted.replace(f" {label}", f"\n{label}")
+    return formatted.strip()
 
 # ----- Query validation / splitting -----
 
+from wordfreq import zipf_frequency
+
 def _is_valid_query(query: str) -> bool:
-    """Reject empty, too-short, or non-alphabetic gibberish before retrieval."""
     stripped = query.strip()
     if len(stripped) < _MIN_QUERY_CHARS:
         return False
     if not _ALPHA_PATTERN.search(stripped):
         return False
-    # Reject if alphabetic characters are a small minority (e.g. "asdkj!!!123???")
-    alpha_count = sum(c.isalpha() for c in stripped)
-    if alpha_count / len(stripped) < 0.5:
+
+    words = re.findall(r"[a-zA-Z]+", stripped.lower())
+    if not words:
         return False
-    return True
 
+    # At least one word must be a recognizable English word (zipf_frequency > 0
+    # means it's in the frequency dictionary at all).
+    recognized = sum(1 for w in words if len(w) >= 3 and zipf_frequency(w, "en") > 0)
+    return recognized >= 1
 
+def _is_injection_attempt(query: str) -> bool:
+    q = query.lower()
+    return any(p in q for p in _INJECTION_PATTERNS)
+
+_NUMBER_PATTERN = re.compile(r"\d[\d,.]*")
+   
+
+_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.?!])\s+")
+
+def _strip_unverified_numbers(answer: str, context_text: str) -> str:
+    """Remove only sentences containing numbers not present in context."""
+    context_numbers = set(_NUMBER_PATTERN.findall(context_text))
+    sentences = _SENTENCE_SPLIT_PATTERN.split(answer.strip())
+    kept = []
+    for sentence in sentences:
+        sentence_numbers = set(_NUMBER_PATTERN.findall(sentence))
+        if any(num not in context_numbers for num in sentence_numbers):
+            continue  # drop only this sentence
+        kept.append(sentence)
+    cleaned = " ".join(kept).strip()
+    return cleaned if cleaned else FALLBACK_MESSAGE
+
+_MIN_SOURCE_WORDS_FOR_OVERLAP_CHECK = 60
+
+def _has_verbatim_overlap(answer: str, contexts: list[tuple[str, str]], n: int = 15, max_overlap_ratio: float = 0.6) -> bool:
+    """
+    Flag likely document-dumping: most of the ANSWER consists of words
+    that are part of some n-gram verbatim-matched against the context.
+
+    Exempts answers whose overlap is fully explained by a single short
+    source chunk (e.g. a short, dense legal clause with no paraphrase
+    room) — checked per-chunk rather than against the combined context,
+    so that an unrelated extra chunk pulled in by retrieval can't push
+    a short, legitimately-quoted answer over the length threshold.
+    """
+    answer_words = answer.lower().split()
+    if len(answer_words) < n:
+        return False
+
+    for _, chunk_text in contexts:
+        chunk_words = chunk_text.lower().split()
+        if len(chunk_words) < _MIN_SOURCE_WORDS_FOR_OVERLAP_CHECK:
+            continue  # this chunk is too short to meaningfully "dump"
+
+        if len(chunk_words) < n:
+            continue
+
+        chunk_ngrams = {" ".join(chunk_words[i:i+n]) for i in range(len(chunk_words) - n + 1)}
+        covered = [False] * len(answer_words)
+        for i in range(len(answer_words) - n + 1):
+            if " ".join(answer_words[i:i+n]) in chunk_ngrams:
+                for j in range(i, i + n):
+                    covered[j] = True
+
+        overlap_word_count = sum(covered)
+        if (overlap_word_count / len(answer_words)) > max_overlap_ratio:
+            return True  # flagged against at least one substantial chunk
+
+    return False    
 def _split_subqueries(query: str) -> list[str]:
     """Split a compound question into sub-questions for separate retrieval."""
     parts = [p.strip() for p in _SUBQUERY_SPLIT_PATTERN.split(query) if p.strip()]
@@ -137,6 +220,29 @@ def _merge_retrievals(results: list) -> _retriever.RetrievalResult:
     return _retriever.RetrievalResult(chunks=merged_chunks, is_relevant=any_relevant)
 
 
+def _build_retrieval_query(query: str, history: list[dict] | None) -> str:
+    """Augment query with previous turn, used only as a fallback retry."""
+    if not history:
+        return query
+    last_turn = history[-1]
+    if not last_turn.get("is_relevant", False):
+        return query  # nothing useful to carry forward
+    return f"{last_turn.get('query', '')} {last_turn.get('answer', '')} {query}"
+
+
+def _retrieve_with_history_fallback(query: str, history: list[dict] | None):
+    """Try retrieval on the plain query first; retry with history only if it fails."""
+    result = retrieve(query)
+    if result.is_relevant or not history:
+        return result
+
+    augmented_query = _build_retrieval_query(query, history)
+    if augmented_query == query:
+        return result  # nothing to add
+
+    augmented_result = retrieve(augmented_query)
+    return augmented_result if augmented_result.is_relevant else result
+
 def _is_fare_list_query(query: str) -> bool:
     q = query.lower()
     return any(phrase in q for phrase in _FARE_LIST_PHRASES)
@@ -152,7 +258,6 @@ def _truncate(text: str, max_chars: int = MAX_CHUNK_CHARS) -> str:
 
 
 def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
-    """Pick prompt context chunks based on query intent."""
     if _is_fare_list_query(query):
         by_fare: dict[str, tuple[str, str]] = {}
         for chunk in chunks:
@@ -166,7 +271,7 @@ def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
         for fare_name in ("Value", "Flexi", "Xtra"):
             if fare_name in by_fare:
                 continue
-            supplemental = retrieve(f"{fare_name} fare baggage allowance", k=3)
+            supplemental = retrieve(f"{fare_name} fare baggage allowance")
             for chunk in supplemental.chunks:
                 if chunk.text.startswith(f"{fare_name} "):
                     by_fare[fare_name] = (chunk.source, chunk.text)
@@ -175,21 +280,21 @@ def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
         if by_fare:
             return [by_fare[name] for name in ("Value", "Flexi", "Xtra") if name in by_fare]
 
-    # Only take the single-fare shortcut for short, single-topic queries.
-    # Longer/compound questions shouldn't be narrowed to just one fare chunk.
     if len(query.split()) <= _SINGLE_TOPIC_MAX_WORDS:
-        for chunk in chunks:
-            for prefix in _FARE_SECTION_PREFIXES:
-                if prefix.strip().lower() in query.lower() and chunk.text.startswith(prefix):
+        query_lower = query.lower()
+        matched_fares = [p.strip() for p in _FARE_SECTION_PREFIXES if p.strip().lower() in query_lower]
+        if len(matched_fares) == 1:
+            for chunk in chunks:
+                if chunk.text.startswith(matched_fares[0] + " "):
                     return [(chunk.source, chunk.text)]
 
     return [(chunk.source, chunk.text) for chunk in chunks[:LLM_CONTEXT_CHUNKS]]
 
-
 def _build_prompt(query: str, contexts: list[tuple[str, str]]) -> str:
     context_blocks: list[str] = []
     for source, text in contexts:
-        context_blocks.append(f"[Source: {source}]\n{_truncate(text)}")
+        formatted_text = _format_fields(text)
+        context_blocks.append(f"[Source: {source}]\n{_truncate(formatted_text)}")
 
     context_text = "\n\n".join(context_blocks)
     return (
@@ -212,6 +317,7 @@ def _generate_with_ollama(prompt: str) -> str:
             "num_ctx": OLLAMA_NUM_CTX,
             "temperature": 0.1,
             "num_predict": OLLAMA_NUM_PREDICT,
+            "stop": ["CUSTOMER QUESTION:", "\nCUSTOMER", "ANSWER:"],
         },
     }
     response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
@@ -229,6 +335,7 @@ def _generate_with_groq(prompt: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_tokens": OLLAMA_NUM_PREDICT,
+        "stop": ["CUSTOMER QUESTION:", "ANSWER:"],
     }
     response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
     response.raise_for_status()
@@ -244,7 +351,7 @@ def _generate(prompt: str) -> str:
 
 # ----- Main entrypoint -----
 
-def ask(query: str) -> dict:
+def ask(query: str, history: list[dict] | None = None) -> dict:
     """
     Run retrieval + guarded generation for a user question.
 
@@ -257,12 +364,14 @@ def ask(query: str) -> dict:
 
     if not _is_valid_query(query):
         return {"answer": INVALID_QUERY_MESSAGE, "sources": [], "is_relevant": False}
-
+    
+    if _is_injection_attempt(query):
+        return {"answer": SECURITY_REFUSAL_MESSAGE, "sources": [], "is_relevant": False}
     subqueries = _split_subqueries(query)
     if len(subqueries) > 1:
         retrieval = _merge_retrievals([retrieve(q) for q in subqueries])
     else:
-        retrieval = retrieve(query)
+        retrieval = _retrieve_with_history_fallback(query, history)
 
     if DEBUG:
         print("\n===== RAW RETRIEVED CHUNKS =====")
@@ -294,7 +403,18 @@ def ask(query: str) -> dict:
         print("===== END =====\n")
 
     answer = _generate(prompt)
-    return {"answer": answer, "sources": sources, "is_relevant": True}
+    if DEBUG:
+        print("===== RAW LLM ANSWER (pre-checks) =====")
+        print(answer)
+        print("===== END RAW ANSWER =====\n")
+    context_text = " ".join(text for _, text in contexts)
+    if _has_verbatim_overlap(answer, contexts, n=15):
+        answer = SECURITY_REFUSAL_MESSAGE
+    else:
+        answer = _strip_unverified_numbers(answer, context_text)
+        
+    is_relevant = answer not in (FALLBACK_MESSAGE, SECURITY_REFUSAL_MESSAGE)
+    return {"answer": answer, "sources": sources, "is_relevant": is_relevant}
 
 
 TEST_QUERIES = [
@@ -314,13 +434,14 @@ if __name__ == "__main__":
     else:
         pending = [" ".join(cli_args).strip()] if cli_args else []
 
+    history: list[dict] = []
     while True:
         question = pending.pop(0) if pending else input("\nQuestion (empty to quit): ").strip()
         if not question:
             break
 
         started = time.perf_counter()
-        result = ask(question)
+        result = ask(question, history=history)
         elapsed_seconds = time.perf_counter() - started
 
         print("\nAnswer:")
@@ -333,3 +454,9 @@ if __name__ == "__main__":
             print("- (none)")
         print(f"\nIs relevant: {result['is_relevant']}")
         print(f"Response time: {elapsed_seconds:.2f} seconds")
+
+        history.append({
+            "query": question,
+            "answer": result["answer"],
+            "is_relevant": result["is_relevant"],
+        })
