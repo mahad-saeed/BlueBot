@@ -309,6 +309,9 @@ def _sections_from_lines(lines: list[str]) -> list[str]:
         else:
             final_sections.append(section)
 
+        # Filter out heading-only stubs (section title with no body content)
+        MIN_CHUNK_WORDS = 10
+        final_sections = [s for s in final_sections if len(s.split()) >= MIN_CHUNK_WORDS]
     return final_sections
 
 

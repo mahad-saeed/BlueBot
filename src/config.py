@@ -20,7 +20,7 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Distance-margin retrieval: fetch up to K_MAX candidates, keep those within margin of best
 RETRIEVAL_K_MAX = 8
-DISTANCE_MARGIN = 0.25
+DISTANCE_MARGIN = 0.35
 
 # Retrieval / generation tuning (smaller values = faster on low-end hardware)
 #RETRIEVAL_TOP_K = 3
