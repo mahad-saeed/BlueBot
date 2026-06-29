@@ -90,7 +90,8 @@ If the customer asks what fare types exist, list only the fare type names found 
 Do not mention meals, seat selection, or BlueMiles unless the customer asks.
 Always write numbers as digits (e.g. 4,150), never spell them out in words.
 If the context does not contain the answer, say: "I don't have that information. Please contact Airblue support at 111-247-258."
-Answer the customer's question directly using the relevant facts from the context. Keep it brief, but include the actual facts requested — don't just restate the fare name."""
+Answer the customer's question directly using the relevant facts from the context. Keep it brief, but include the actual facts requested — don't just restate the fare name.
+Paraphrase the facts in your own words; do not copy sentences from the context verbatim."""
 
 _FARE_SECTION_PREFIXES = ("Value ", "Flexi ", "Xtra ")
 _FARE_LIST_PHRASES = ("fare type", "fare types", "types of fare", "what fares", "which fares")
@@ -412,7 +413,7 @@ def ask(query: str, history: list[dict] | None = None) -> dict:
         answer = SECURITY_REFUSAL_MESSAGE
     else:
         answer = _strip_unverified_numbers(answer, context_text)
-        
+
     is_relevant = answer not in (FALLBACK_MESSAGE, SECURITY_REFUSAL_MESSAGE)
     return {"answer": answer, "sources": sources, "is_relevant": is_relevant}
 
