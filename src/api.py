@@ -10,14 +10,31 @@ from pydantic import BaseModel
 
 from src.pipeline import ask
 
-app = FastAPI(title="BlueBot API")
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from src.embedder import embed_and_store
+    from src.retriever import _COLLECTION
+    if _COLLECTION.count() == 0:
+        print("[startup] chroma_db empty, running ingestion...")
+        embed_and_store()
+        print("[startup] ingestion complete")
+    else:
+        print(f"[startup] chroma_db ready, {_COLLECTION.count()} chunks loaded")
+    yield
+
+app = FastAPI(title="BlueBot API", lifespan=lifespan)
+
+#app = FastAPI(title="BlueBot API")
 
 
 class HistoryTurn(BaseModel):
     query: str
     answer: str
     is_relevant: bool
-    
+
 class ChatRequest(BaseModel):
     query: str
     history: list[HistoryTurn] = []
