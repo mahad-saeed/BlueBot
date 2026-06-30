@@ -310,7 +310,23 @@ def _truncate(text: str, max_chars: int = MAX_CHUNK_CHARS) -> str:
 
 
 def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
-    if _is_fare_list_query(query):
+    query_lower = query.lower()
+    matched_fares = [p.strip() for p in _FARE_SECTION_PREFIXES if p.strip().lower() in query_lower]
+
+    top_chunks = chunks[:LLM_CONTEXT_CHUNKS]
+    fare_prefixed_count = sum(
+        1 for c in top_chunks
+        if any(c.text.startswith(p) for p in _FARE_SECTION_PREFIXES)
+    )
+    # Only treat this as a "summarize across fares" question if fare-prefixed
+    # chunks already dominate top-ranked retrieval AND no fare is named —
+    # i.e. retrieval itself is telling us this is a fare-attribute question,
+    # rather than us guessing from keywords.
+    looks_like_fare_attribute_query = (
+        not matched_fares and fare_prefixed_count >= 2
+    )
+
+    if _is_fare_list_query(query) or looks_like_fare_attribute_query:
         by_fare: dict[str, tuple[str, str]] = {}
         for chunk in chunks:
             for prefix in _FARE_SECTION_PREFIXES:
@@ -319,7 +335,6 @@ def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
                     existing = by_fare.get(fare_name)
                     if existing is None or len(chunk.text) > len(existing[1]):
                         by_fare[fare_name] = (chunk.source, chunk.text)
-
         for fare_name in ("Value", "Flexi", "Xtra"):
             if fare_name in by_fare:
                 continue
@@ -328,17 +343,13 @@ def _select_contexts(query: str, chunks: list) -> list[tuple[str, str]]:
                 if chunk.text.startswith(f"{fare_name} "):
                     by_fare[fare_name] = (chunk.source, chunk.text)
                     break
-
         if by_fare:
             return [by_fare[name] for name in ("Value", "Flexi", "Xtra") if name in by_fare]
 
-    if len(query.split()) <= _SINGLE_TOPIC_MAX_WORDS:
-        query_lower = query.lower()
-        matched_fares = [p.strip() for p in _FARE_SECTION_PREFIXES if p.strip().lower() in query_lower]
-        if len(matched_fares) == 1:
-            for chunk in chunks:
-                if chunk.text.startswith(matched_fares[0] + " "):
-                    return [(chunk.source, chunk.text)]
+    if len(query.split()) <= _SINGLE_TOPIC_MAX_WORDS and len(matched_fares) == 1:
+        for chunk in chunks:
+            if chunk.text.startswith(matched_fares[0] + " "):
+                return [(chunk.source, chunk.text)]
 
     return [(chunk.source, chunk.text) for chunk in chunks[:LLM_CONTEXT_CHUNKS]]
 
@@ -420,7 +431,8 @@ def ask(query: str, history: list[dict] | None = None) -> dict:
     if _is_injection_attempt(query):
         return {"answer": SECURITY_REFUSAL_MESSAGE, "sources": [], "is_relevant": False}
 
-    if _is_fast_path_irrelevant(query):
+    fast_path_check_query = _build_retrieval_query(query, history)
+    if _is_fast_path_irrelevant(fast_path_check_query):
         return {"answer": FALLBACK_MESSAGE, "sources": [], "is_relevant": False}
 
     subqueries = _split_subqueries(query)
@@ -518,3 +530,8 @@ if __name__ == "__main__":
             "answer": result["answer"],
             "is_relevant": result["is_relevant"],
         })
+
+
+
+
+
