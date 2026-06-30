@@ -117,6 +117,11 @@ def _format_fields(text: str) -> str:
         formatted = formatted.replace(f" {label}", f"\n{label}")
     return formatted.strip()
 
+def _is_fallback_answer(answer: str) -> bool:
+    """Catch LLM-generated 'I don't know' phrasing that doesn't exactly match FALLBACK_MESSAGE."""
+    markers = ("don't have that information", "don't have information about that")
+    return any(marker in answer.lower() for marker in markers)
+
 # ----- Query validation / splitting -----
 
 from wordfreq import zipf_frequency
@@ -414,7 +419,9 @@ def ask(query: str, history: list[dict] | None = None) -> dict:
     else:
         answer = _strip_unverified_numbers(answer, context_text)
 
-    is_relevant = answer not in (FALLBACK_MESSAGE, SECURITY_REFUSAL_MESSAGE)
+    is_relevant = (
+    answer != SECURITY_REFUSAL_MESSAGE
+    and not _is_fallback_answer(answer))
     return {"answer": answer, "sources": sources, "is_relevant": is_relevant}
 
 
