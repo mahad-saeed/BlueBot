@@ -109,6 +109,7 @@ _FIELD_LABELS = (
     "BlueMiles Rewards:", "Refunds & Exchanges:",
 )
 
+
 def _format_fields(text: str) -> str:
     """Insert newlines before recognized field labels so the LLM sees clearly
     separated facts instead of a run-on paragraph (reduces fact-blending)."""
@@ -145,6 +146,51 @@ def _is_valid_query(query: str) -> bool:
 def _is_injection_attempt(query: str) -> bool:
     q = query.lower()
     return any(p in q for p in _INJECTION_PATTERNS)
+
+# Cast a wide net deliberately - false negatives here (missing a real keyword)
+# are worse than false positives (letting a junk query through to retrieval,
+# which just costs ~0.5s and gets caught by DISTANCE_THRESHOLD anyway).
+_DOMAIN_KEYWORDS = frozenset({
+    "fare", "fares", "ticket", "tickets", "book", "booking", "reservation",
+    "reservations", "price", "fee", "fees", "cost", "pay", "payment",
+    "value", "flexi", "xtra",
+    "baggage", "bag", "bags", "luggage", "carry", "checked", "weight",
+    "kg", "allowance", "excess", "lost", "damaged",
+    "flight", "flights", "fly", "flying", "departure", "arrival",
+    "delay", "delayed", "cancel", "cancelled", "cancellation",
+    "domestic", "international", "route", "destination", "schedule",
+    "checkin", "check-in", "boarding", "airport", "counter", "pnr",
+    "gate", "terminal",
+    "refund", "refunds", "exchange", "exchanges", "change", "voucher",
+    "credit", "reschedule",
+    "bluemiles", "miles", "loyalty", "rewards", "redeem", "redemption",
+    "membership", "member",
+    "passenger", "passengers", "guest", "guests", "child", "infant",
+    "visa", "documents", "policy", "rules", "rights", "medical",
+    "assistance", "wheelchair", "pregnant",
+    "contact", "support", "helpline", "complaint", "feedback", "agent",
+    "seat", "seats", "meal", "meals", "online", "app", "website",
+})
+
+_FAST_PATH_MAX_WORDS = 6
+
+def _has_domain_keyword(query: str) -> bool:
+    words = {w.lower() for w in _ALPHA_PATTERN.findall(query)} if False else {
+        w.lower() for w in re.findall(r"[a-zA-Z]+", query)
+    }
+    return bool(words & _DOMAIN_KEYWORDS)
+
+def _is_fast_path_irrelevant(query: str) -> bool:
+    """
+    Conservative pre-retrieval filter. Only blocks queries that are BOTH
+    short (<=6 words) AND contain zero domain vocabulary - a narrow trap
+    for obvious junk/small-talk. Anything longer, or containing any domain
+    word, falls through to normal retrieval, which remains the real
+    relevance judge via DISTANCE_THRESHOLD.
+    """
+    if len(query.split()) > _FAST_PATH_MAX_WORDS:
+        return False
+    return not _has_domain_keyword(query)
 
 _NUMBER_PATTERN = re.compile(r"\d[\d,.]*")
    
@@ -373,6 +419,10 @@ def ask(query: str, history: list[dict] | None = None) -> dict:
     
     if _is_injection_attempt(query):
         return {"answer": SECURITY_REFUSAL_MESSAGE, "sources": [], "is_relevant": False}
+
+    if _is_fast_path_irrelevant(query):
+        return {"answer": FALLBACK_MESSAGE, "sources": [], "is_relevant": False}
+
     subqueries = _split_subqueries(query)
     if len(subqueries) > 1:
         retrieval = _merge_retrievals([retrieve(q) for q in subqueries])
