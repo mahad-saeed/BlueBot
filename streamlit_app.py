@@ -346,18 +346,18 @@ def _render_message(msg: dict) -> None:
         if msg.get("response_time"):
             meta_html = f'<div class="ab-meta">{msg["response_time"]:.1f}s</div>'
 
+        bubble_inner = (
+            f'<div class="ab-badge {badge_class}">{badge_text}</div>'
+            f'<div>{content}</div>'
+            f'{sources_html}'
+            f'{meta_html}'
+        )
+
         st.markdown(
-            f"""
-            <div class="ab-row bot">
-                <div class="ab-avatar bot">AB</div>
-                <div class="ab-bubble bot">
-                    <div class="ab-badge {badge_class}">{badge_text}</div>
-                    <div>{content}</div>
-                    {sources_html}
-                    {meta_html}
-                </div>
-            </div>
-            """,
+            f'<div class="ab-row bot">'
+            f'<div class="ab-avatar bot">AB</div>'
+            f'<div class="ab-bubble bot">{bubble_inner}</div>'
+            f'</div>',
             unsafe_allow_html=True,
         )
 
